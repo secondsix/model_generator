@@ -3,7 +3,8 @@
 import argparse
 import json
 import re
-import shutil
+import os
+import tempfile
 from collections import Counter
 from copy import copy
 from pathlib import Path
@@ -93,53 +94,94 @@ def is_parameter_type(model_type: str) -> bool:
     return clean_text(model_type).endswith("参数")
 
 
-def get_data_type(name: str):
-    """根据属性名称生成模板支持的数据类型、精度和配置。"""
-    name = clean_text(name)
+ALLOWED_DATA_TYPES = {"boolean", "date", "double", "enum", "float", "int", "long", "string", "geoPoint", "file", "password"}
 
-    if re.search(r"(状态|故障|报警|开关|启停|是否)", name):
-        return {
-            "data_type": "boolean",
-            "precision": "",
-            "config": json.dumps(
-                {
-                    "falseValue": "false",
-                    "trueText": "是",
-                    "trueValue": "true",
-                    "falseText": "否",
-                    "type": "boolean",
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        }
 
-    if re.search(r"(日期|时刻|时间戳)", name):
-        return {
-            "data_type": "date",
-            "precision": "",
-            "config": '{"tz":"Asia/Shanghai","format":"timestamp","type":"date"}',
-        }
+def get_data_type(name: str, unit: str = ""):
+    """单位优先；无单位时按名称辅助判断，未知内容作为字符串。"""
+    name, unit = clean_text(name), clean_text(unit)
+    if unit in ALLOWED_DATA_TYPES:
+        kind, output_unit = unit, ""
+    elif unit in {"次", "个", "件", "台", "只", "count", "pcs"}:
+        kind = "long" if re.search(r"累计|总", name) else "int"
+        output_unit = unit
+    elif unit in {"是/否", "开/关", "true/false"}:
+        kind, output_unit = "boolean", ""
+    elif unit in {"日期", "时间戳", "timestamp"}:
+        kind, output_unit = "date", ""
+    elif unit and unit not in {"-", "—", "/", "无", "无单位"}:
+        kind, output_unit = "double", unit
+    else:
+        output_unit = ""
+        if re.search(r"密码|口令", name):
+            kind = "password"
+        elif re.search(r"文件|图片|附件", name):
+            kind = "file"
+        elif re.search(r"经纬度|地理坐标", name):
+            kind = "geoPoint"
+        elif re.search(r"日期|时刻|时间戳", name):
+            kind = "date"
+        elif re.search(r"是否|故障|报警|开关|启停", name):
+            kind = "boolean"
+        elif re.search(r"状态|模式|枚举", name):
+            kind = "enum"
+        elif re.search(r"总产量|累计产量|累计次数|总次数", name):
+            kind = "long"
+        elif re.search(r"次数|数量|个数|计数", name):
+            kind = "int"
+        else:
+            kind = "string"
+    config = {"type": kind}
+    precision = ""
+    if kind in {"double", "float", "int", "long"}:
+        config["round"] = "HALF_UP"
+        if output_unit:
+            config["unit"] = output_unit
+        if kind in {"double", "float"}:
+            precision = 2
+            config["scale"] = precision
+    elif kind == "boolean":
+        config.update(falseValue="false", trueValue="true", trueText="是", falseText="否")
+    elif kind == "date":
+        config.update(tz="Asia/Shanghai", format="timestamp")
+    elif kind == "geoPoint":
+        config.update(lonProperty="lon", latProperty="lat")
+    elif kind == "file":
+        config.update(bodyType="url", mediaType="*/*")
+    return {"data_type": kind, "unit": output_unit, "precision": precision,
+            "config": json.dumps(config, ensure_ascii=False, separators=(",", ":"))}
 
-    if re.search(r"(总产量|累计产量)", name):
-        return {
-            "data_type": "long",
-            "precision": "",
-            "config": '{"round":"HALF_UP","type":"long"}',
-        }
 
-    if re.search(r"(次数|数量|个数|计数)", name):
-        return {
-            "data_type": "int",
-            "precision": "",
-            "config": '{"round":"HALF_UP","type":"int"}',
-        }
-
-    return {
-        "data_type": "double",
-        "precision": 2,
-        "config": '{"round":"HALF_UP","scale":2,"type":"double"}',
-    }
+def read_tag_library(source_file):
+    """读取标签库首个 sheet，原样保留标签标识和名称。"""
+    wb = load_workbook(source_file, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        header = find_header_row(ws, ("标识", "名称", "单位"))
+        headers = get_header_map(ws, header)
+        parameters, identifiers = [], set()
+        skipped = Counter()
+        for row in range(header + 1, ws.max_row + 1):
+            def value(field):
+                return clean_text(ws.cell(row, headers[field]).value) if field in headers else ""
+            identifier, name = value("标识"), value("名称")
+            if not identifier and not name:
+                continue
+            if value("标签类型") not in ("", "property"):
+                skipped[value("标签类型")] += 1
+                continue
+            if not identifier or not name:
+                raise ValueError(f"第 {row} 行缺少标识或名称")
+            if identifier in identifiers:
+                raise ValueError(f"第 {row} 行属性标识重复：{identifier}")
+            identifiers.add(identifier)
+            parameters.append({"identifier": identifier, "name": name, "unit": value("单位"), "description": value("说明")})
+        if not parameters:
+            raise ValueError("标签库中没有可导出的 property 标签。")
+        product = source_file.stem.removesuffix("物模型标签库导入") or "物模型"
+        return ws.title, {product: {"parameters": parameters}}, Counter(property=len(parameters)), skipped
+    finally:
+        wb.close()
 
 
 def find_header_row(ws, required_columns, max_rows=30):
@@ -224,7 +266,7 @@ def adjust_output_layout(ws, header_row, last_row):
         ws.row_dimensions[row].height = max(ws.row_dimensions[row].height or 15, line_count * 15)
 
 
-def read_models(source_file: Path):
+def read_models(source_file: Path, expand_names=True):
     """读取设计表第一个 sheet，并按产品名称汇总“xx参数”属性。"""
     wb = load_workbook(source_file, data_only=True)
     try:
@@ -273,12 +315,12 @@ def read_models(source_file: Path):
             unit = get_optional_cell(ws, row, headers, "unit")
             description = get_optional_cell(ws, row, headers, "description")
 
-            for expanded_name in expand_property_name(property_name):
+            for expanded_name in (expand_property_name(property_name) if expand_names else [property_name]):
                 model["parameters"].append(
                     {
                         "name": expanded_name,
                         "unit": unit,
-                        "description": description or expanded_name,
+                        "description": (description or expanded_name) if expand_names else description,
                         "model_type": model_type,
                     }
                 )
@@ -293,9 +335,11 @@ def generate_model_file(model_name, model_info, template_file: Path, output_dir:
     """复制实际导入模板，并写入一个产品的全部参数属性。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{safe_filename(model_name)}物模型导入.xlsx"
-    shutil.copy2(template_file, output_file)
+    if output_file.resolve() == template_file.resolve():
+        raise ValueError("保存位置不能与模板相同。")
 
-    wb = load_workbook(output_file)
+    wb = load_workbook(template_file)
+    temporary = None
     try:
         if not wb.worksheets:
             raise RuntimeError(f"{template_file.name} 不包含工作表")
@@ -311,19 +355,18 @@ def generate_model_file(model_name, model_info, template_file: Path, output_dir:
             for col in range(1, ws.max_column + 1):
                 ws.cell(row, col).value = None
 
-        used_identifiers = Counter()
         current_row = data_start_row
         for parameter in model_info["parameters"]:
             if current_row != style_row:
                 copy_row_style(ws, style_row, current_row)
 
             name = parameter["name"]
-            type_info = get_data_type(name)
+            type_info = get_data_type(name, parameter["unit"])
             values = {
-                "属性标识": make_unique_identifier(name, used_identifiers),
+                "属性标识": parameter["identifier"],
                 "属性名称": name,
                 "数据类型": type_info["data_type"],
-                "单位": parameter["unit"],
+                "单位": type_info["unit"],
                 "精度": type_info["precision"],
                 "数据类型配置": type_info["config"],
                 "来源": "设备",
@@ -332,7 +375,9 @@ def generate_model_file(model_name, model_info, template_file: Path, output_dir:
                 "存储方式": "存储",
             }
             for field, value in values.items():
-                ws.cell(current_row, headers[field]).value = value
+                cell = ws.cell(current_row, headers[field], value)
+                if isinstance(value, str):
+                    cell.data_type = "s"
             current_row += 1
 
         # 删除未被覆盖的模板示例行，避免示例数据混入导入结果。
@@ -341,9 +386,14 @@ def generate_model_file(model_name, model_info, template_file: Path, output_dir:
 
         adjust_output_layout(ws, header_row, current_row - 1)
 
-        wb.save(output_file)
+        with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".xlsx", delete=False) as temp:
+            temporary = Path(temp.name)
+        wb.save(temporary)
+        os.replace(temporary, output_file)
     finally:
         wb.close()
+        if temporary and temporary.exists():
+            temporary.unlink()
 
     print(f"[生成成功] {output_file.name}  属性数：{len(model_info['parameters'])}")
     return output_file
@@ -351,7 +401,7 @@ def generate_model_file(model_name, model_info, template_file: Path, output_dir:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Excel 物模型批量生成工具")
-    parser.add_argument("--source", type=Path, required=True, help="物模型设计表路径")
+    parser.add_argument("--source", type=Path, required=True, help="物模型标签库导入文件路径")
     parser.add_argument("--template", type=Path, required=True, help="物模型导入模板路径")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="输出目录")
     parser.add_argument("--only", help="只生成指定产品名称，便于测试")
@@ -368,7 +418,7 @@ def generate_files(source_file: Path, template_file: Path, output_dir: Path, onl
     if not template_file.exists():
         raise FileNotFoundError(f"找不到文件：{template_file}")
 
-    sheet_name, models, included_types, skipped_types = read_models(source_file)
+    sheet_name, models, included_types, skipped_types = read_tag_library(source_file)
     if only:
         if only not in models:
             available = "、".join(models.keys())
@@ -378,6 +428,8 @@ def generate_files(source_file: Path, template_file: Path, output_dir: Path, onl
     generated_files = []
     total = len(models)
     for index, (model_name, model_info) in enumerate(models.items(), start=1):
+        if (output_dir / f"{safe_filename(model_name)}物模型导入.xlsx").resolve() == source_file:
+            raise ValueError("保存位置不能与标签库源文件相同。")
         generated_files.append(
             generate_model_file(model_name, model_info, template_file, output_dir)
         )
@@ -393,6 +445,31 @@ def generate_files(source_file: Path, template_file: Path, output_dir: Path, onl
     }
 
 
+def generate_many_files(source_files, template_file, output_dir, progress=None):
+    """预检所有标签库，再逐个生成，防止同名文件相互覆盖。"""
+    sources = list(dict.fromkeys(Path(path).resolve() for path in source_files))
+    if not sources:
+        raise ValueError("请至少选择一个标签库文件。")
+    template_file, output_dir = Path(template_file).resolve(), Path(output_dir).resolve()
+    planned, destinations = [], set()
+    for source in sources:
+        _, models, _, _ = read_tag_library(source)
+        for name, model in models.items():
+            destination = (output_dir / f"{safe_filename(name)}物模型导入.xlsx").resolve()
+            if destination in destinations:
+                raise ValueError(f"所选标签库的输出文件名重复：{destination.name}")
+            if destination in sources or destination == template_file:
+                raise ValueError(f"输出文件不能覆盖源文件或模板：{destination}")
+            destinations.add(destination)
+            planned.append((name, model))
+    generated = []
+    for index, (name, model) in enumerate(planned, 1):
+        generated.append(generate_model_file(name, model, template_file, output_dir))
+        if progress:
+            progress(index, len(planned), name, generated[-1])
+    return {"generated_files": generated, "output_dir": output_dir}
+
+
 def main():
     args = parse_args()
     result = generate_files(
@@ -404,8 +481,8 @@ def main():
 
     print("=" * 60)
     print("Excel 物模型批量生成工具")
-    print(f"设计表第一个 sheet：{result['sheet_name']}")
-    print("处理规则：物模型类型以“参数”结尾")
+    print(f"标签库第一个 sheet：{result['sheet_name']}")
+    print("处理规则：从标签库读取 property 标签，按单位判断数据类型")
     print(f"纳入类型：{dict(result['included_types'])}")
     print(f"跳过类型：{dict(result['skipped_types'])}")
     print(f"全部完成：{len(result['generated_files'])} 个文件")
